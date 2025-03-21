@@ -1,49 +1,57 @@
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, request, jsonify
+from utils.detection import detect_road, detect_trees
+from utils.georeference import get_georeference_data, pixel_to_geo
+from utils.measurements import calculate_metrics, extend_road, count_trees
+import os
+import numpy as np
+import tensorflow as tf
 
 app = Flask(__name__)
+UPLOAD_FOLDER = 'uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# A simple in-memory structure to store tasks
-tasks = []
+road_model = tf.keras.models.load_model('model/road_unet_resnet.keras')
+tree_model = tf.keras.models.load_model('model/tree_unet_resnet_finetune.keras')
 
-@app.route('/', methods=['GET'])
-def home():
-    # Display existing tasks and a form to add a new task
-    html = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Todo List</title>
-</head>
-<body>
-    <h1>Todo List</h1>
-    <form action="/add" method="POST">
-        <input type="text" name="task" placeholder="Enter a new task">
-        <input type="submit" value="Add Task">
-    </form>
-    <ul>
-        {% for task in tasks %}
-        <li>{{ task }} <a href="/delete/{{ loop.index0 }}">x</a></li>
-        {% endfor %}
-    </ul>
-</body>
-</html>
-'''
-    return render_template_string(html, tasks=tasks)
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    file = request.files['file']
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+    file.save(file_path)
 
-@app.route('/add', methods=['POST'])
-def add_task():
-    # Add a new task from the form data
-    task = request.form.get('task')
-    if task:
-        tasks.append(task)
-    return home()
+    crs, transform, bounds = get_georeference_data(file_path)
+    road_mask = detect_road(file_path, road_model)
+    road_polygons = pixel_to_geo(road_mask, transform)
 
-@app.route('/delete/<int:index>', methods=['GET'])
-def delete_task(index):
-    # Delete a task based on its index
-    if index < len(tasks):
-        tasks.pop(index)
-    return home()
+    tree_mask = detect_trees(file_path, tree_model)
+    tree_polygons = pixel_to_geo(tree_mask, transform)
+
+    metrics = [calculate_metrics(polygon) for polygon in road_polygons]
+
+    return jsonify({
+        'crs': str(crs),
+        'road_polygons': [p.__geo_interface__ for p in road_polygons],
+        'tree_polygons': [p.__geo_interface__ for p in tree_polygons],
+        'metrics': metrics
+    })
+
+@app.route('/extend', methods=['POST'])
+def extend_road_api():
+    data = request.json
+    polygons = [Polygon(p['coordinates'][0]) for p in data['road_polygons']]
+    extension_width = float(data['extension_width'])
+    extended_polygons = [extend_road(p, extension_width) for p in polygons]
+    tree_polygons = [Polygon(p['coordinates'][0]) for p in data['tree_polygons']]
+    tree_count = sum(count_trees(tree_polygons, ep) for ep in extended_polygons)
+
+    return jsonify({
+        'extended_polygons': [p.__geo_interface__ for p in extended_polygons],
+        'tree_count': tree_count
+    })
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0')
+    app.run(debug=True)
